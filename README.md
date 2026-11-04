@@ -7,7 +7,7 @@
 ## 功能概览
 
 - **知识入库**：加载 30 份带 YAML 元数据的 Markdown 文档；将文本切分、向量化并写入 Milvus。新环境中的空知识库会在 Compose 启动时初始化。
-- **检索问答**：LangGraph Agent 根据问题调用知识库工具。检索链路先从 Milvus 获取候选片段，再按角色过滤，并可调用 Jina Reranker 重排序；服务不可用时回退到 Milvus 原排序。
+- **检索问答**：LangGraph Agent 根据问题调用知识库工具。检索链路先从 Milvus 获取候选片段，再按角色过滤，并可调用 Jina Reranker 重排序；服务不可用时保留输入候选顺序（单 Query 为 Milvus 排名，多 Query 为 RRF 融合排名）。
 - **来源追溯**：回答通过 SSE 流式返回，结束后向页面发送文档名、`doc_id`、`chunk_id` 和片段正文。
 - **会话管理**：LangGraph Checkpointer 将对话状态保存到 PostgreSQL；前端支持新建、切换、删除会话，并用浏览器本地存储保存会话列表。
 - **文件上传**：支持 PDF、TXT、Markdown，单文件最大 10 MB；使用文件 SHA-256 识别重复上传，解析后写入 Milvus。
@@ -197,6 +197,46 @@ RERANK_CANDIDATE_K=20 python -m evaluation.compare_retrieval
 ```
 
 该脚本只读取当前 Milvus 集合，不改写向量；运行需要有效的 `ZHIPUAI_API_KEY`、`JINA_API_KEY` 和 `MILVUS_URI`。为防止把上传资料发往外部服务，脚本仅接受本项目标记为 `source: synthetic` 的内置模拟文档，遇到其他来源会停止。报告包含题集校验值、候选数、逐题文档编号和回退题号，保存到被 Git 忽略的 `evaluation/results/`。
+
+### 可选：多 Query 扩展
+
+默认保持 `MULTI_QUERY_ENABLED=false`。启用后，每次知识库工具调用会保留原问题，使用 DeepSeek 生成最多两个补充查询（简单问题可以不扩展）。每路均按同一服务端角色过滤，按片段主键去重、用 RRF 融合排名，融合后仍只保留 20 个候选，再以原问题调用 Jina 重排序并选取前 5 条。查询扩展不改变模型自行决定是否调用知识库工具的方式。
+
+扩展请求失败或 JSON 不合法时保留原检索结果；某一路补充检索失败时保留其余结果。此功能只改变查询流程，不需要重新向量化或修改 Milvus 集合。额外的模型请求和检索会增加延迟与 API 用量。
+
+在 `.env` 中配置并重启后端后生效：
+
+```env
+MULTI_QUERY_ENABLED=true
+MULTI_QUERY_MODEL=deepseek-v4-flash
+MULTI_QUERY_TIMEOUT=10
+```
+
+用原有题集对比单 Query 与多 Query（不受启用开关影响，脚本始终计算两种方案）：
+
+```bash
+python -m evaluation.compare_multi_query --limit 3  # 先试跑
+python -m evaluation.compare_multi_query            # 53 道有目标文档的题
+```
+
+两路复用同一次原问题检索，候选预算均为 20、最终输出均为 5 个片段；扩展后的补充检索最多两路并发。报告记录候选集目标文档召回、最终 Hit@5 / Recall@5 / MRR、完整目标文档找齐率、耗时、扩展 Token 用量和失败题号，并单列两边 Jina 均成功的子集，以识别外部服务失败对结果的影响。脚本只读现有 Milvus，发送给外部重排序服务的候选必须来自内置模拟知识库。结果保存在 `evaluation/results/multi_query_compare_*.json`，不会提交到 Git。
+
+2026-11-04 使用原有 53 道有目标文档的题完成真实对照（Milvus 共 47 个片段，均使用 Jina，含失败回退）：
+
+| 指标 | 单 Query + Jina | 多 Query + Jina |
+| --- | ---: | ---: |
+| Hit@5 | 98.11% | 100.00% |
+| Macro Recall@5 | 93.08% | 92.77% |
+| MRR | 0.8459 | 0.9308 |
+| 目标文档全部找齐率 | 88.68% | 86.79% |
+| 20 个候选片段中的目标文档平均召回率 | 96.54% | 98.43% |
+| 平均检索总耗时（含扩展和重排，不含答案生成） | 3.70 秒 | 5.35 秒 |
+
+两路均有 43/53 次 Jina 请求成功，各有 10 次超时回退，但失败题号不同。两边 Jina 均成功的 37 题中，单 Query / 多 Query 的 Hit@5 为 97.30% / 100%，Macro Recall@5 为 94.59% / 97.30%，目标文档全部找齐率为 91.89% / 94.59%，MRR 为 0.8739 / 0.9324。这个子集帮助观察正常重排时的差异，不能代替完整题集结果。
+
+多 Query 确实找回了 Q-048 的目标文档 S-005，原查询的 20 个候选里没有该文档；Q-024、Q-060 则在多 Query 一侧重排超时后出现文档找齐率下降。整个实验有 41 题实际扩展、8 题不扩展、4 题因扩展响应 JSON 不合法而回退，补充检索共 80 次且均成功。扩展模型报告用量为 9,310 个输入 Token、9,123 个输出 Token。
+
+**当前保持默认关闭。** 本次实验表明它能补足个别漏召回，但全量 Recall 和找齐率没有提升，平均每题多约 1.65 秒；不能仅凭 Hit@5 达到 100% 就宣称整体问答质量提升。题目仍是小规模自建集，以上均为检索指标，不是回答准确率。此处使用同次运行的单 Query 作为基线，不与 10 月 2 日的旧报告直接相减。完整逐题记录在 `evaluation/results/multi_query_compare_20261104.json`。
 
 ### 完整问答链路
 

@@ -11,13 +11,13 @@ logger = logging.getLogger(__name__)
 
 
 def rerank(query: str, hits: list[dict], top_k: int = 5) -> list[dict]:
-    """调用 Jina；服务不可用时保留 Milvus 原有排序。"""
+    """调用 Jina；服务不可用时保留传入候选的顺序。"""
     if not hits:
         return []
 
     fallback = hits[:top_k]
     if not JINA_API_KEY or JINA_API_KEY == "replace-me":
-        logger.warning("未配置 JINA_API_KEY，使用 Milvus 原排序")
+        logger.warning("未配置 JINA_API_KEY，使用候选原排序")
         return fallback
 
     payload = {
@@ -59,5 +59,5 @@ def rerank(query: str, hits: list[dict], top_k: int = 5) -> list[dict]:
         return reranked_hits[:top_k]
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
         # 不记录请求正文、文档内容或 API Key。
-        logger.warning("Jina 重排序失败（%s），使用 Milvus 原排序", type(exc).__name__)
+        logger.warning("Jina 重排序失败（%s），使用候选原排序", type(exc).__name__)
         return fallback

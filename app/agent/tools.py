@@ -3,9 +3,10 @@ from pathlib import Path
 from langchain.tools import ToolRuntime, tool
 
 from app.RAG.retriever import retriever
+from app.RAG.multi_query import retrieve_multi_query
 from app.RAG.reranker import rerank
 from app.agent.context import AgentContext
-from app.config import COLLECTION_NAME, RERANK_CANDIDATE_K, RERANK_ENABLED, TOP_K
+from app.config import COLLECTION_NAME, MULTI_QUERY_ENABLED, RERANK_CANDIDATE_K, RERANK_ENABLED, TOP_K
 
 def build_search_tool(client, embedding_model):
     @tool(response_format="content_and_artifact")
@@ -35,6 +36,18 @@ def build_search_tool(client, embedding_model):
             limit=RERANK_CANDIDATE_K if RERANK_ENABLED else TOP_K,
             role=role,
         )
+        if MULTI_QUERY_ENABLED:
+            # 保留原问题，扩展最多两路；融合后仍限制为相同候选数。
+            candidate_hits = retrieve_multi_query(
+                client=client,
+                collection_name=COLLECTION_NAME,
+                query=query,
+                embedding_model=embedding_model,
+                original_hits=candidate_hits,
+                limit=RERANK_CANDIDATE_K if RERANK_ENABLED else TOP_K,
+                role=role,
+            ).hits
+
         if not candidate_hits:
             return "知识库中没有找到相关资料。", []
 
