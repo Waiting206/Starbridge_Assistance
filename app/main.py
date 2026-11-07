@@ -17,6 +17,7 @@
 """
 
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.RAG.Loader import load_documents
 from app.RAG.spiltter import document_spitter
 from app.RAG.vector_store import create_embedding_model, index_documents, init_milvus
+from app.RAG.bm25 import BM25Index
+from app.config import BM25_ENABLED, COLLECTION_NAME
 from app.agent.init_agent import init_agent
 from app.agent.tools import build_search_tool
 from app.api.chat import router as chat_router
@@ -37,12 +40,19 @@ async def lifespan(app: FastAPI):
     """在服务启动时创建共享资源，在关闭时释放它们。"""
     client = init_milvus()
     embedding_model = create_embedding_model()
-    search_tool = build_search_tool(client, embedding_model)
+    keyword_index = BM25Index(client, COLLECTION_NAME) if BM25_ENABLED else None
+    if keyword_index is not None:
+        try:
+            keyword_index.refresh()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("BM25 初始化失败（%s），查询时重试", type(exc).__name__)
+    search_tool = build_search_tool(client, embedding_model, keyword_index)
 
     with init_agent(tools=[search_tool]) as (agent,checkpointer):
         app.state.agent = agent
         app.state.milvus_client = client
         app.state.embedding_model = embedding_model
+        app.state.bm25_index = keyword_index
         app.state.checkpointer = checkpointer
         yield
 

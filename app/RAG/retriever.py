@@ -1,6 +1,11 @@
 from app.security import AccessRole
 
 
+OUTPUT_FIELDS = [
+    "text", "source", "source_name", "doc_id", "title", "audience", "page", "start_index",
+]
+
+
 def audience_filter_for_role(role: AccessRole) -> str:
     """只允许检索元数据audience中包含当前角色的知识片段。"""
     return f'JSON_CONTAINS(audience, "{role}")'
@@ -20,15 +25,7 @@ def retriever(
         data=[query_vector],
         limit=limit,
         filter=audience_filter_for_role(role),
-        output_fields=[
-            "text",
-            "source",
-            "source_name",
-            "doc_id",
-            "title",
-            "audience",
-            "page",
-            "start_index",
-        ],
+        output_fields=OUTPUT_FIELDS,
+        consistency_level="Strong",
     )
     return results[0]

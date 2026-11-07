@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 
+from app.RAG.fusion import fuse_rankings
 from app.RAG.query_expansion import QueryExpansion, expand_queries
 from app.RAG.retriever import retriever
 from app.security import AccessRole
@@ -22,27 +23,6 @@ class MultiQueryResult:
     failed_queries: list[dict] = field(default_factory=list)
 
 
-def fuse_rankings(rankings: list[list[dict]], limit: int, k: int = 60) -> list[dict]:
-    """RRF 只融合排名，避免直接相加不同查询的相似度分数。"""
-    hits_by_id = {}
-    scores = {}
-    for ranking in rankings:
-        seen = set()
-        for rank, hit in enumerate(ranking, 1):
-            chunk_id = hit["id"]
-            if chunk_id in seen:
-                continue
-            seen.add(chunk_id)
-            hits_by_id.setdefault(chunk_id, hit)
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
-    # 相同分数时沿用首次出现顺序，优先保留原问题的排序。
-    ordered = sorted(hits_by_id, key=lambda chunk_id: -scores[chunk_id])
-    return [
-        {**hits_by_id[chunk_id], "fusion_score": scores[chunk_id]}
-        for chunk_id in ordered[:limit]
-    ]
-
-
 def retrieve_multi_query(
     *,
     client,
@@ -53,9 +33,11 @@ def retrieve_multi_query(
     limit: int,
     role: AccessRole = "customer",
     query_model=None,
+    retrieval_fn=None,
 ) -> MultiQueryResult:
     """原问题已经检索一次；扩展查询最多并发两路，最终仍只保留 limit 条。"""
     started = time.perf_counter()
+    retrieval_fn = retrieval_fn or retriever
     authorized = lambda hits: [
         hit for hit in hits if role in hit["entity"].get("audience", [])
     ]
@@ -70,7 +52,7 @@ def retrieve_multi_query(
                 (
                     alternative,
                     executor.submit(
-                        retriever,
+                        retrieval_fn,
                         client=client,
                         collection_name=collection_name,
                         query=alternative,

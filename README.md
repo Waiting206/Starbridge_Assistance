@@ -7,7 +7,8 @@
 ## 功能概览
 
 - **知识入库**：加载 30 份带 YAML 元数据的 Markdown 文档；将文本切分、向量化并写入 Milvus。新环境中的空知识库会在 Compose 启动时初始化。
-- **检索问答**：LangGraph Agent 根据问题调用知识库工具。检索链路先从 Milvus 获取候选片段，再按角色过滤，并可调用 Jina Reranker 重排序；服务不可用时保留输入候选顺序（单 Query 为 Milvus 排名，多 Query 为 RRF 融合排名）。
+- **双路检索问答**：LangGraph Agent 根据问题调用知识库工具；并行执行 Milvus 向量召回与 BM25 关键词召回，用 RRF 融合和去重，再由 Jina 重排序。最多返回 5 个参考片段，由 Agent 核对是否足以支持答案；依据不足时澄清或说明信息不足。
+- **检索降级**：任一路召回失败时使用另一条路径；重排暂时性网络、限流或服务端错误最多重试一次，仍不可用时保留候选原排序。来源数据区分 COSINE、RRF 与 Jina 分数，不将它们解释为回答准确率。
 - **来源追溯**：回答通过 SSE 流式返回，结束后向页面发送文档名、`doc_id`、`chunk_id` 和片段正文。
 - **会话管理**：LangGraph Checkpointer 将对话状态保存到 PostgreSQL；前端支持新建、切换、删除会话，并用浏览器本地存储保存会话列表。
 - **文件上传**：支持 PDF、TXT、Markdown，单文件最大 10 MB；使用文件 SHA-256 识别重复上传，解析后写入 Milvus。
@@ -17,14 +18,20 @@
 
 ```mermaid
 flowchart LR
-    Browser[Vue 3 页面] --> Nginx[Nginx 静态服务与 /api 代理]
+    Browser[Vue 3 页面] --> Nginx[Nginx 静态服务与 API 代理]
     Nginx --> API[FastAPI]
     API --> Agent[LangGraph Agent]
     Agent --> Tool[知识库检索工具]
     Tool -->|向量召回| Milvus[(Milvus)]
-    Tool -->|可选重排序| Jina[Jina Reranker]
+    Tool -->|关键词召回| BM25[BM25 内存索引]
+    BM25 -.从现有片段重建.-> Milvus
+    Milvus --> RRF[RRF 融合去重]
+    BM25 --> RRF
+    RRF --> Jina[Jina 重排序]
+    Jina --> Tool
     Agent --> PG[(PostgreSQL Checkpointer)]
-    API -->|上传、解析、向量化| Milvus
+    API -->|上传入库| Milvus
+    API -.使索引失效.-> BM25
 ```
 
 | 部分 | 实现 |
@@ -32,13 +39,13 @@ flowchart LR
 | 页面 | Vue 3、Vite、Vue Router |
 | API | FastAPI、SSE |
 | Agent | LangChain、LangGraph、DeepSeek |
-| 向量化与检索 | 智谱 Embedding API、Milvus、Jina Reranker（可选） |
+| 向量化与检索 | 智谱 Embedding API、Milvus、BM25Okapi、Jieba、RRF、Jina Reranker |
 | 会话持久化 | PostgreSQL、LangGraph Checkpointer |
 | 部署 | Docker Compose、Nginx |
 
 ## 快速启动：Docker Compose
 
-需要 Docker Desktop，以及可用的 DeepSeek、智谱模型服务密钥。启用重排序时还需要 Jina API Key。
+需要 Docker Desktop，以及可用的 DeepSeek、智谱模型服务密钥；建议配置 Jina 密钥以启用重排序。
 
 1. 在项目根目录复制配置文件：
 
@@ -55,7 +62,7 @@ flowchart LR
    SUPPORT_ACCESS_TOKEN=自行生成的随机长字符串
    ```
 
-   如需启用重排序，将 `JINA_API_KEY` 换成有效密钥，并保持 `RERANK_ENABLED=true`；暂不使用时设置 `RERANK_ENABLED=false`。不要提交 `.env`。默认数据库密码仅用于本机演示，部署到其他环境前应修改 `POSTGRES_PASSWORD`。
+   建议配置有效的 `JINA_API_KEY` 并保持 `RERANK_ENABLED=true`。缺少密钥或重排失败时保留召回候选原排序；可通过 `RERANK_ENABLED=false` 关闭重排。不要提交 `.env`。默认数据库密码仅用于本机演示，部署到其他环境前应修改 `POSTGRES_PASSWORD`。
 
 3. 构建并启动：
 
@@ -172,9 +179,63 @@ npm run dev
 | `policy` | 6 | 套餐、额度和服务规则 |
 | `release` | 4 | 版本公告与历史变化 |
 
-文档的 YAML 头记录 `doc_id`、版本、状态、适用角色等元数据。检索时依据 `audience` 过滤；当前没有按版本状态或生效日期进行结构化过滤，历史规则仍需由 Agent 根据文档内容判断。
+文档的 YAML 头记录 `doc_id`、版本、状态、适用角色等元数据。向量和 BM25 两路均依据 `audience` 限制访问范围；BM25 返回候选前还会查询 Milvus 复核最新权限。当前没有按版本状态或生效日期进行结构化过滤，历史规则仍需由 Agent 根据文档内容判断。
 
 评测题位于 `data/knowledge/starbridge-rag-starter/evaluation/questions.jsonl`，共 60 题，覆盖事实、操作流程、跨文档、历史时效、访问控制和证据不足六类场景。其中 **53 题标注了目标文档**，可计算检索指标。项目分别评估检索排序和完整问答链路，两组数字的口径不同。
+
+### 当前链路：BM25 双路召回与 RRF 融合
+
+默认配置：
+
+```env
+BM25_ENABLED=true
+BM25_REFRESH_SECONDS=30
+RRF_K=60
+RERANK_ENABLED=true
+RERANK_CANDIDATE_K=20
+RERANK_MAX_RETRIES=1
+MULTI_QUERY_ENABLED=false
+```
+
+- **召回**：Milvus 向量检索与 BM25 关键词检索并发执行，各取最多 20 个片段。BM25 使用 `rank-bm25==0.2.2` 的 BM25Okapi，Jieba 负责中文分词，保留 SSO、CSV、版本号和错误码；按角色分别为标题与正文建立索引。
+- **融合**：按片段主键去重，采用 `RRF(d) = sum(1 / (60 + rank_i(d)))` 合并排名，保留 20 个候选。向量距离与 BM25 分数不直接相加。任一路召回失败时继续使用另一条；两路均失败时告知查询服务暂不可用。
+- **重排**：以原问题调用 `jina-reranker-v3.5`，返回前 5 个参考片段。超时、连接错误、429 或 5xx 最多重试一次；仍不可用或未配置密钥时保留候选原排序。来源中标明分数类型，Jina 相关性分数不代表回答准确率。
+- **上传同步**：Milvus 是唯一持久化数据源，BM25 使用可重建的内存索引，不需要迁移集合或重新向量化。上传完成后使本进程索引失效，下一次检索重建；其他进程最多在 30 秒 TTL 后刷新。关键词候选返回前再次读取 Milvus 元数据，剔除已撤权或删除的片段。
+- **回答约束**：检索命中不等于足够回答。Agent 应核对套餐、角色、数字和日期，只回答资料明确支持的部分，依据不足时澄清，忽略文档中的越权指令。前端在回答完成但没有来源时显示友好的空状态。
+
+多 Query 仍是可选功能；启用时原问题和补充查询均走双路召回，融合后执行一次最终重排。现有 30 篇文档与 60 道原题保持不变，便于沿用相同的对照基础。
+
+#### 同题对照评测
+
+```bash
+python -m evaluation.compare_hybrid --limit 3
+python -m evaluation.compare_hybrid
+```
+
+脚本比较“向量＋重排”和“双路 RRF＋重排”，候选预算均为 20、最终输出均为 5。两组复用同一次向量召回；候选顺序完全相同时复用同一次 Jina 请求，否则交替两组请求先后顺序。记录候选召回、Hit@5、Macro Recall@5、MRR、完整目标文档找齐率和服务回退。7 道没有目标文档的题单独观察，不计入检索命中率，也不能仅凭是否返回片段判定回答正确。
+
+Milvus 暂不可用时，可单独运行离线模式：
+
+```bash
+python -m evaluation.compare_hybrid --offline
+```
+
+离线模式读取内置模拟文档，使用真实智谱 Embedding、内存精确 COSINE、相同 BM25/RRF 代码和真实 Jina API。它不访问或写入 Milvus，**不能代表 Milvus 在线性能或 FastAPI 完整链路验证**。默认不带 `--offline` 时连接现有 Milvus，不创建或清空集合。结果与向量缓存保存在 Git 忽略的 `evaluation/results/`。
+
+2026-11-05 完成上述离线对照：30 篇文档切分为 47 个片段，原题共 60 道，其中 53 道带目标文档。
+
+| 指标 | 向量＋重排 | 双路 RRF＋重排 |
+| --- | ---: | ---: |
+| Hit@5 | 98.11%（52/53） | **100%（53/53）** |
+| Macro Recall@5 | 94.03% | **94.97%** |
+| MRR | 0.8931 | 0.8931 |
+| 目标文档全部找齐率 | 90.57% | 90.57% |
+
+双路方案补回 Q-048 的目标文档 S-005。向量组 60 次重排均成功；双路组 1 次在重试后回退至 RRF 排序，该题没有目标文档，不影响上述 53 题指标。两组重排均成功的 59 题也得到相同检索指标。结果见 `evaluation/results/hybrid_compare_20261105_offline.json`。
+
+该结果说明关键词召回在当前题集上补回了一个漏检问题，提升幅度有限；小型模拟知识库上的命中率不等于回答准确率，也不能外推到真实企业语料。后续应扩充独立问题与真实文档，并分别验证在线性能和生成答案质量。
+
+实现验证：46 项自动化测试通过，前端构建通过。另使用真实 DeepSeek、Embedding 与 Jina 完成两道进程内 Agent 问答检查：已收录的 SSO/审计日志问题正常回答并返回来源，未收录的 API 限流问题说明信息不足。该检查使用离线语料适配器，不包含 HTTP/SSE、PostgreSQL Checkpointer 或在线 Milvus 验证。
 
 ### 向量检索与重排序：同题配对评测
 
@@ -200,7 +261,7 @@ RERANK_CANDIDATE_K=20 python -m evaluation.compare_retrieval
 
 ### 可选：多 Query 扩展
 
-默认保持 `MULTI_QUERY_ENABLED=false`。启用后，每次知识库工具调用会保留原问题，使用 DeepSeek 生成最多两个补充查询（简单问题可以不扩展）。每路均按同一服务端角色过滤，按片段主键去重、用 RRF 融合排名，融合后仍只保留 20 个候选，再以原问题调用 Jina 重排序并选取前 5 条。查询扩展不改变模型自行决定是否调用知识库工具的方式。
+默认保持 `MULTI_QUERY_ENABLED=false`。以下结果为历史纯向量扩展实验；当前启用后，每次知识库工具调用会保留原问题，使用 DeepSeek 生成最多两个补充查询（简单问题可以不扩展）。每路均按同一服务端角色过滤，按片段主键去重、用 RRF 融合排名，融合后仍只保留 20 个候选，再以原问题调用 Jina 重排序并选取前 5 条。查询扩展不改变模型自行决定是否调用知识库工具的方式。
 
 扩展请求失败或 JSON 不合法时保留原检索结果；某一路补充检索失败时保留其余结果。此功能只改变查询流程，不需要重新向量化或修改 Milvus 集合。额外的模型请求和检索会增加延迟与 API 用量。
 
@@ -276,7 +337,8 @@ python evaluation/evaluate.py            # 运行全部 60 题
 - 项目使用客服共享令牌区分两种角色，尚未实现用户登录、按组织和项目授权的完整权限体系。
 - 知识上传尚未加入身份认证、审核或文档发布流程；上传内容会直接进入向量库。
 - 文档版本、状态和生效日期未作为结构化检索条件；冲突或时效问题需要进一步人工核验。
-- 当前测试主要覆盖角色访问边界，尚未形成覆盖上传、重排序和部署流程的完整自动化测试。
-- 重排序依赖外部 Jina 服务；发生错误时会回退到 Milvus 顺序，但检索质量可能变化。
+- 自动化测试覆盖角色访问边界、多 Query、BM25 索引刷新、上传失效通知、双路降级及重排异常回退；尚未覆盖生产并发压力与完整部署测试。
+- BM25 内存索引适合当前小规模知识库；每个后端进程各保留一份索引，定期全量重建，大语料需改用专用全文索引或 Milvus 内置稀疏检索。
+- Jina 服务失败时使用候选原排序，排序质量可能下降；检索命中不等于回答正确，仍需对生成答案做独立评测。
 
 本项目用于展示企业知识库的数据组织、检索问答和可复现部署流程，当前定位是可运行的作品集项目。

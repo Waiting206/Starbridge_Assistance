@@ -51,6 +51,9 @@ def _index_uploaded_file(request: Request, saved_path: Path, original_name: str,
     )
     # 确保接口返回后新知识立即对检索可见。
     request.app.state.milvus_client.flush(COLLECTION_NAME)
+    keyword_index = getattr(request.app.state, "bm25_index", None)
+    if keyword_index is not None:
+        keyword_index.invalidate()
     return len(chunks)
 
 

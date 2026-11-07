@@ -25,3 +25,14 @@ RERANK_CANDIDATE_K = max(TOP_K, int(os.getenv("RERANK_CANDIDATE_K", "20")))
 MULTI_QUERY_ENABLED = os.getenv("MULTI_QUERY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 MULTI_QUERY_MODEL = os.getenv("MULTI_QUERY_MODEL", "deepseek-v4-flash")
 MULTI_QUERY_TIMEOUT = float(os.getenv("MULTI_QUERY_TIMEOUT", "10"))
+
+# BM25 与向量双路召回，使用 RRF 融合排名。
+BM25_ENABLED = os.getenv("BM25_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+BM25_REFRESH_SECONDS = float(os.getenv("BM25_REFRESH_SECONDS", "30"))
+RRF_K = int(os.getenv("RRF_K", "60"))
+if BM25_REFRESH_SECONDS < 0 or RRF_K < 1:
+    raise ValueError("BM25_REFRESH_SECONDS 必须非负、RRF_K 必须为正")
+
+RERANK_MAX_RETRIES = int(os.getenv("RERANK_MAX_RETRIES", "1"))
+if not 0 <= RERANK_MAX_RETRIES <= 2:
+    raise ValueError("RERANK_MAX_RETRIES 必须在 0～2 之间")

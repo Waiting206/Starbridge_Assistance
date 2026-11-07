@@ -93,7 +93,8 @@ langchain-huggingface==1.2.2
 
 # Token 计数与关键词检索
 tiktoken
-rank-bm25
+rank-bm25==0.2.2
+jieba==0.42.1
 
 
 # =========================================================

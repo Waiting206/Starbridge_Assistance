@@ -16,6 +16,7 @@ const deleteError = ref('')
 const messageList = ref(null)
 
 const activeSession = computed(() => sessions.value.find((item) => item.threadId === activeThreadId.value))
+const hasUserQuestion = computed(() => activeSession.value?.messages.some((message) => message.role === 'user') || false)
 const activeSources = computed(() => {
   const messages = activeSession.value?.messages || []
   const latestAssistant = [...messages].reverse().find((message) => message.role === 'assistant')
@@ -185,6 +186,6 @@ onMounted(() => { loadStoredSessions(); scrollToLatest() })
       </div>
       <ChatInput :disabled="isLoading" @send="sendMessage" />
     </section>
-    <aside class="context-panel"><SourcePanel :sources="activeSources" /><UploadPanel /></aside>
+    <aside class="context-panel"><SourcePanel :sources="activeSources" :has-question="hasUserQuestion" :loading="isLoading" /><UploadPanel /></aside>
   </main>
 </template>

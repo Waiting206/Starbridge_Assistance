@@ -1,5 +1,9 @@
 <script setup>
-defineProps({ sources: { type: Array, default: () => [] } })
+defineProps({
+  sources: { type: Array, default: () => [] },
+  hasQuestion: { type: Boolean, default: false },
+  loading: { type: Boolean, default: false },
+})
 </script>
 
 <template>
@@ -16,7 +20,8 @@ defineProps({ sources: { type: Array, default: () => [] } })
     </div>
     <div v-else class="source-empty">
       <div class="empty-orbit" aria-hidden="true"><span></span></div>
-      <strong>等待检索</strong><p>发送问题后，相关知识片段会显示在这里。</p>
+      <strong>{{ loading ? '正在整理依据' : hasQuestion ? '暂无可展示的知识来源' : '等待提问' }}</strong>
+      <p>{{ loading ? '本次可用的知识来源会在回答完成后显示。' : hasQuestion ? '本次没有可展示的知识来源，可查看助手回复中的说明。' : '发送问题后，相关知识片段会显示在这里。' }}</p>
     </div>
   </section>
 </template>

@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage
 from app.RAG.multi_query import fuse_rankings, retrieve_multi_query
 from app.RAG.query_expansion import expand_queries
 from app.agent.context import AgentContext
+from app.RAG.reranker import RerankResult
 
 
 class FakeQueryModel:
@@ -86,15 +87,16 @@ def test_all_extra_retrieval_failures_keep_original_order(monkeypatch):
 def test_tool_reranks_with_original_query_and_preserves_source_structure(monkeypatch):
     from app.agent import tools
     observed = {}
+    monkeypatch.setattr(tools, "BM25_ENABLED", False)
     monkeypatch.setattr(tools, "MULTI_QUERY_ENABLED", True)
     monkeypatch.setattr(tools, "RERANK_ENABLED", True)
-    monkeypatch.setattr(tools, "retriever", lambda **kwargs: [hit(1)])
+    monkeypatch.setattr(tools, "retriever", lambda **kwargs: [hit(1 if kwargs["query"] == "原问题" else 2)])
     monkeypatch.setattr("app.RAG.query_expansion.create_query_model", lambda: FakeQueryModel('{"queries":["查询一"]}'))
     monkeypatch.setattr("app.RAG.multi_query.retriever", lambda **kwargs: [hit(2)])
-    def rank(**kwargs):
-        observed.update(kwargs)
-        return kwargs["hits"][:1]
-    monkeypatch.setattr(tools, "rerank", rank)
+    def rank(query, hits, **kwargs):
+        observed.update(query=query, hits=hits)
+        return RerankResult([{**hits[0], "rerank_score": 0.9}], "ok")
+    monkeypatch.setattr(tools, "rerank_with_status", rank)
     tool = tools.build_search_tool(object(), object())
     content, sources = tool.func("原问题", SimpleNamespace(context=AgentContext(role="customer")))
     assert observed["query"] == "原问题"
@@ -121,8 +123,10 @@ def test_partial_extra_retrieval_failure_keeps_successful_results(monkeypatch):
 
 def test_disabled_feature_does_not_generate_queries(monkeypatch):
     from app.agent import tools
+    monkeypatch.setattr(tools, "BM25_ENABLED", False)
     monkeypatch.setattr(tools, "MULTI_QUERY_ENABLED", False)
-    monkeypatch.setattr(tools, "RERANK_ENABLED", False)
+    monkeypatch.setattr(tools, "RERANK_ENABLED", True)
+    monkeypatch.setattr(tools, "rerank_with_status", lambda query, hits, **kwargs: RerankResult([{**hits[0], "rerank_score": 0.9}], "ok"))
     monkeypatch.setattr(tools, "retriever", lambda **kwargs: [hit(1)])
     def forbidden(**kwargs):
         raise AssertionError("Disabled feature must not call expansion")
